@@ -6,7 +6,7 @@ from opencv_utils import draw_text_lines
 
 
 if __name__ == "__main__":
-    file_name = "your/video/path"
+    file_name = "C:/Users/andre/PycharmProjects/turret/videos/stereo_birds_04.mp4"
 
     cap = cv.VideoCapture(file_name)
 
@@ -30,7 +30,7 @@ if __name__ == "__main__":
     is_first_resize = True
     paused = False
 
-    fgbg = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
+    bg_subtractor = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
     kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))
     trackers = cv.legacy.MultiTracker_create()
 
@@ -64,10 +64,10 @@ if __name__ == "__main__":
         if paused:
             pass # не пихать в историю одинаковые бессмысленные кадры на паузе
         elif detection_mode:
-            fgmask = fgbg.apply(left)
-            fgmask = cv.morphologyEx(fgmask, cv.MORPH_OPEN, kernel)
+            bg_mask = bg_subtractor.apply(left)
+            bg_mask = cv.morphologyEx(bg_mask, cv.MORPH_OPEN, kernel)
 
-            boxes = detect_objects(fgmask, min_area=60)
+            boxes = detect_objects(bg_mask, min_area=60)
 
             detection_frames -= 1
             if detection_frames == 0:
@@ -96,7 +96,8 @@ if __name__ == "__main__":
         # рисуем bounding boxes и пишем информацию об объекте из карты глубины
         display_diff = cv.cvtColor(diff, cv.COLOR_GRAY2BGR)
 
-        for (x, y, w, h) in boxes:
+        for box in boxes:
+            x, y, w, h = box[0], box[1], box[2], box[3]
             cv.rectangle(display_diff, (x, y), (x + w, y + h), (0, 255, 0), 4)
 
             object_diff = diff[y:y + h, x:x + w]

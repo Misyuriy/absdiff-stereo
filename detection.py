@@ -4,31 +4,23 @@ from calibration import auto_calibrate_stereo
 from opencv_utils import draw_text_lines
 
 
-def detect_objects(mask, min_area=100, min_white_ratio=0.2):
+def detect_objects(mask, min_area=100, max_area=1000):
     contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     boxes = []
 
     for contour in contours:
         area = cv.contourArea(contour)
-        if area < min_area:
+        if area < min_area or area > max_area:
             continue
 
         x, y, w, h = cv.boundingRect(contour)
-
-        roi = mask[y:y + h, x:x + w]
-        white_pixels = cv.countNonZero(roi)
-        white_ratio = white_pixels / (w * h)
-
-        if white_ratio < min_white_ratio:
-            continue
-
-        boxes.append((x, y, w, h))
+        boxes.append((x, y, w, h, area))
 
     return boxes
 
 
 if __name__ == "__main__":
-    file_name = "your/video/path"
+    file_name = "C:/Users/andre/PycharmProjects/turret/videos/stereo-0724-13.mp4"
 
     cap = cv.VideoCapture(file_name)
 
@@ -50,17 +42,23 @@ if __name__ == "__main__":
     v_shift, h_shift = auto_calibrate_stereo(frame, border)
 
     is_first_resize = True
-    paused = False
 
-    fgbg = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
+    bg_subtractor = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
     kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))
 
+    diff_threshold = 30
+
+    show_mask: bool = False  # показываем маску или же сам кадр
+    detection_method: int = 0
+    # 0 - absdiff mask & background mask
+    # 1 - absdiff mask only
+    # 2 - background mask only
+
     while cap.isOpened():
-        if not paused:
-            ret, frame = cap.read()
-            if not ret:
-                print("Can't receive frame (stream end?). Exiting ...")
-                break
+        ret, frame = cap.read()
+        if not ret:
+            print("Can't receive frame (stream end?). Exiting ...")
+            break
 
         f = min((float(width) / (float(frame.shape[1] / 2) - 2 * border)),
                 (float(height) / (float(frame.shape[0]) - 2 * border)))
@@ -73,46 +71,70 @@ if __name__ == "__main__":
 
         diff = cv.absdiff(right, left)
 
-        # detection/tracking
-        boxes = []
-        if not paused: # не пихать в историю одинаковые бессмысленные кадры на паузе
-            fgmask = fgbg.apply(left)
-            fgmask = cv.morphologyEx(fgmask, cv.MORPH_OPEN, kernel)
+        # absdiff маска
+        _, diff_mask = cv.threshold(diff, diff_threshold, 255, cv.THRESH_BINARY)  # порог (30 дефолт)
+        diff_mask = cv.morphologyEx(diff_mask, cv.MORPH_OPEN, kernel)  # удаление шума
+        diff_mask = cv.morphologyEx(diff_mask, cv.MORPH_CLOSE, kernel)  # заполнение пробелов
 
-            boxes = detect_objects(fgmask, min_area=50)
+        # background маска
+        bg_mask = bg_subtractor.apply(left)
+        bg_mask = cv.morphologyEx(bg_mask, cv.MORPH_OPEN, kernel)
 
-        # рисуем bounding boxes и пишем информацию об объекте из карты глубины
-        display_diff = cv.cvtColor(diff, cv.COLOR_GRAY2BGR)
+        # объединяем
+        combined_mask = cv.bitwise_and(bg_mask, diff_mask)
+        combined_mask = cv.morphologyEx(combined_mask, cv.MORPH_CLOSE, kernel)
 
-        for (x, y, w, h) in boxes:
-            cv.rectangle(display_diff, (x, y), (x + w, y + h), (0, 255, 0), 4)
+        # выбираем маску в зависимости от режима
+        masks = [combined_mask, diff_mask, bg_mask]
+        used_mask = masks[detection_method]
+        boxes = detect_objects(used_mask)
 
-            object_diff = diff[y:y + h, x:x + w]
-            median_diff = np.median(object_diff[object_diff > 0])
+        display = cv.cvtColor(used_mask if show_mask else diff, cv.COLOR_GRAY2BGR)
 
-            cv.putText(display_diff, f"{median_diff:.1f}", (x, y - 20),
+        for (x, y, w, h, area) in boxes:
+            cv.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            text_y = y - 40
+            if text_y < 10:  # если объект вверху кадра
+                text_y = y + h + 20  # показываем текст под объектом
+
+            cv.putText(display, f"{area} px", (x, text_y),
                        cv.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 255), 1)
 
-        status_text = ""
-        if paused:
-            status_text = "Paused"
-        else:
-            status_text = f"{len(boxes)} objects detected"
-        cv.putText(display_diff, status_text, (32, 32),
+        match detection_method:
+            case 0:
+                status_text = f"COMBINED mask, detecting {len(boxes)} targets"
+            case 1:
+                status_text = f"ABSDIFF mask, detecting {len(boxes)} targets"
+            case 2:
+                status_text = f"BACKGROUND mask, detecting {len(boxes)} targets"
+
+        cv.putText(display, status_text, (32, 32),
                    cv.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 255), 1)
 
-        controls_text = ["SPACE - pause",
-                         "C - recalibrate",
-                         "Q - quit"]
+        controls_text = [
+            "1 - use combined mask",
+            "2 - use absdiff mask",
+            "3 - use background mask",
+            "S - show/hide mask",
+            "C - recalibrate",
+            "Q - quit"
+        ]
 
-        draw_text_lines(display_diff, controls_text, (32, height - 32), bottom_origin=True, color=(0, 255, 255))
+        draw_text_lines(display, controls_text, (32, height + 32), bottom_origin=True, color=(0, 255, 255))
 
-        cv.imshow("resized", display_diff)
+        cv.imshow("resized", display)
 
         key = cv.waitKey(10)
 
-        if key == ord(" "):  # pause/play
-            paused = not paused
+        if key == ord("1"):
+            detection_method = 0
+        if key == ord("2"):
+            detection_method = 1
+        if key == ord("3"):
+            detection_method = 2
+        if key == ord("s"):  # show/hide mask
+            show_mask = not show_mask
         if key == ord("c"):  # recalibrate
             v_shift, h_shift = auto_calibrate_stereo(frame, border)
         if key == ord("q"):  # quit
