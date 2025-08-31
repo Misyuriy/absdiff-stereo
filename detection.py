@@ -1,6 +1,6 @@
 import numpy as np
 import cv2 as cv
-from calibration import auto_calibrate_stereo
+from calibration import calibrate_full
 from opencv_utils import draw_text_lines
 
 
@@ -20,7 +20,7 @@ def detect_objects(mask, min_area=100, max_area=1000):
 
 
 if __name__ == "__main__":
-    file_name = "C:/Users/andre/PycharmProjects/turret/videos/stereo-0724-13.mp4"
+    file_name = "videos/stereo-0724-13.mp4"
 
     cap = cv.VideoCapture(file_name)
 
@@ -29,7 +29,6 @@ if __name__ == "__main__":
     cv.setWindowProperty("resized", cv.WND_PROP_FULLSCREEN, cv.WINDOW_FULLSCREEN)
     (x, y, width, height) = cv.getWindowImageRect("resized")
 
-    roi_top = 640
     border = 50
 
     ret, frame = cap.read()
@@ -39,7 +38,7 @@ if __name__ == "__main__":
     cv.resizeWindow("resized", round(float(frame.shape[1] / 2 - 2 * border) * f),
                     round(float(frame.shape[0] - 2 * border) * f))
 
-    v_shift, h_shift = auto_calibrate_stereo(frame, border)
+    v_shift, h_shift = calibrate_full(frame, border)
 
     is_first_resize = True
 
@@ -136,7 +135,7 @@ if __name__ == "__main__":
         if key == ord("s"):  # show/hide mask
             show_mask = not show_mask
         if key == ord("c"):  # recalibrate
-            v_shift, h_shift = auto_calibrate_stereo(frame, border)
+            v_shift, h_shift = calibrate_full(frame, border)
         if key == ord("q"):  # quit
             break
 

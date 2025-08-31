@@ -3,3 +3,4 @@ venv
 videos
 FBD-SV-2024
 __pycache__
+/yolov8n.pt

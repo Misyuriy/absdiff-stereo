@@ -1,123 +1,196 @@
 import numpy as np
 import cv2 as cv
-from opencv_utils import draw_text_lines
+from sky_detection import detect_sky
 
 
-def auto_calibrate_stereo(frame: np.ndarray, border: int) -> tuple:
-    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-    h, w = gray.shape
+def cropped_mask(mask: np.ndarray, crop_pixels: int):
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2*crop_pixels+1, 2*crop_pixels+1))
+    mask = cv.erode(mask, kernel)
+    h, w = mask.shape
+
+    mask[0:crop_pixels, :] = 0
+    mask[h - crop_pixels:h, :] = 0
+    mask[:, 0:crop_pixels] = 0
+    mask[:, w - crop_pixels:w] = 0
+
+    return mask
+
+
+def calibrate_continuous(frame: np.ndarray,
+                         border: int,
+                         prev_v_shift: int,
+                         prev_h_shift: int,
+                         max_deviation: int = 5) -> tuple:
+    v_range = (max(-border + 1, prev_v_shift - max_deviation), min(border, prev_v_shift + max_deviation + 1))
+    h_range = (max(-border + 1, prev_h_shift - max_deviation), min(border, prev_h_shift + max_deviation + 1))
+    return _calibrate(frame, border, v_range, h_range)
+
+
+def calibrate_full(frame: np.ndarray, border: int) -> tuple:
+    v_range = (-border + 1, border)
+    h_range = (-border + 1, border)
+    return _calibrate_sky(frame, border, v_range, h_range)
+
+
+def _calibrate(frame: np.ndarray,
+               border: int,
+               v_range: tuple,
+               h_range: tuple) -> tuple:
+    height = frame.shape[0]
+    width = frame.shape[1]
+
+    w_half = width // 2
+
+    left_gray = cv.cvtColor(frame[:, :w_half], cv.COLOR_BGR2GRAY)
+    right_gray = cv.cvtColor(frame[:, w_half:], cv.COLOR_BGR2GRAY)
 
     v_shift = 0
     h_shift = 0
     min_mean = float('inf')
 
-    for v in range(-border + 1, border):
-        right_roi = gray[border:h - border, w // 2 + border:w - border]
+    for v in range(v_range[0], v_range[1]):
+        left_roi = left_gray[
+                   border + v:height - border + v,
+                   border:w_half - border]
 
-        left_roi = gray[border + v:h - border + v, border:w // 2 - border]
+        right_roi = right_gray[
+                    border:height - border,
+                    border:w_half - border]
 
         if left_roi.shape != right_roi.shape:
             continue
 
         diff = cv.absdiff(right_roi, left_roi)
-        current_mean = cv.mean(diff)[0]
+        mean = cv.mean(diff)[0]
 
-        if current_mean < min_mean:
-            min_mean = current_mean
+        if mean < min_mean:
+            min_mean = mean
             v_shift = v
 
     min_mean = float('inf')
 
-    for h in range(-border + 1, border):
-        right_roi = gray[border:h - border, w // 2 + border:w - border]
-        left_roi = gray[border + v_shift:h - border + v_shift, border + h:w // 2 - border + h]
+    for h in range(h_range[0], h_range[1]):
+        left_roi = left_gray[
+                   border + v_shift:height - border + v_shift,
+                   border + h:w_half - border + h]
+
+        right_roi = right_gray[
+                    border:height - border,
+                    border:w_half - border]
 
         if left_roi.shape != right_roi.shape:
             continue
 
         diff = cv.absdiff(right_roi, left_roi)
-        current_mean = cv.mean(diff)[0]
+        mean = cv.mean(diff)[0]
 
-        if current_mean < min_mean:
-            min_mean = current_mean
+        if mean < min_mean:
+            min_mean = mean
             h_shift = h
 
     return v_shift, h_shift
 
 
-if __name__ == "__main__":
-    file_name = "your/video/path"
+def calibrate_sky_full(frame: np.ndarray, border: int, mask_crop_pixels: int = 0) -> tuple:
+    v_range = (-border + 1, border)
+    h_range = (-border + 1, border)
+    return _calibrate_sky(frame, border, v_range, h_range, mask_crop_pixels)
 
-    roi_top = 640
-    border = 50
+
+def calibrate_sky_continuous(frame: np.ndarray,
+                             border: int,
+                             prev_v_shift: int,
+                             prev_h_shift: int,
+                             max_deviation: int = 5,
+                             mask_crop_pixels: int = 0) -> tuple:
+    v_range = (max(-border + 1, prev_v_shift - max_deviation), min(border, prev_v_shift + max_deviation + 1))
+    h_range = (max(-border + 1, prev_h_shift - max_deviation), min(border, prev_h_shift + max_deviation + 1))
+    return _calibrate_sky(frame, border, v_range, h_range, mask_crop_pixels)
+
+
+def _calibrate_sky(frame: np.ndarray,
+                   border: int,
+                   v_range: tuple,
+                   h_range: tuple,
+                   mask_crop_pixels: int = 0) -> tuple:
+    height = frame.shape[0]
+    width = frame.shape[1]
+
+    w_half = width // 2
+
+    left = frame[:, :w_half]
+    right = frame[:, w_half:]
+
+    right_small = cv.resize(right, (0, 0), fx=0.5, fy=0.5, interpolation=cv.INTER_AREA)
+    left_small = cv.resize(left, (0, 0), fx=0.5, fy=0.5, interpolation=cv.INTER_AREA)
+    sky_right, fs_right = detect_sky(right_small)
+    sky_left, fs_left = detect_sky(left_small)
+    if mask_crop_pixels > 0 and not (fs_right and fs_left):
+        sky_right = cropped_mask(sky_right, mask_crop_pixels // 2)
+        sky_left = cropped_mask(sky_left, mask_crop_pixels // 2)
+
+    sky_right = cv.resize(sky_right, (w_half, height), interpolation=cv.INTER_NEAREST)
+    sky_left = cv.resize(sky_left, (w_half, height), interpolation=cv.INTER_NEAREST)
+
+    left_gray = cv.cvtColor(left, cv.COLOR_BGR2GRAY)
+    right_gray = cv.cvtColor(right, cv.COLOR_BGR2GRAY)
+
     v_shift = 0
     h_shift = 0
-    manual_v_shift = 0
-    manual_h_shift = 0
+    min_mean = float('inf')
 
-    cap = cv.VideoCapture(file_name)
+    for v in range(v_range[0], v_range[1]):
+        left_roi = left_gray[
+                   border + v:height - border + v,
+                   border:w_half - border]
+        sky_left_roi = sky_left[
+                       border + v:height - border + v,
+                       border:w_half - border]
 
-    cv.namedWindow('resized', cv.WINDOW_NORMAL)
-    cv.setWindowProperty('resized', cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
-    cv.setWindowProperty('resized', cv.WND_PROP_FULLSCREEN, cv.WINDOW_FULLSCREEN)
-    (x, y, width, height) = cv.getWindowImageRect('resized')
+        right_roi = right_gray[
+                    border:height - border,
+                    border:w_half - border]
+        sky_right_roi = sky_right[
+                        border:height - border,
+                        border:w_half - border]
 
-    ret, frame = cap.read()
-    f = min((float(width) / (float(frame.shape[1] / 2) - 2 * border)),
-            (float(height) / (float(frame.shape[0]) - 2 * border)))
-    cv.resizeWindow('resized', round(float(frame.shape[1] / 2 - 2 * border) * f),
-                    round(float(frame.shape[0] - 2 * border) * f))
+        if left_roi.shape != right_roi.shape:
+            continue
 
-    paused = False
+        common_sky_mask = cv.bitwise_and(sky_left_roi, sky_right_roi)
+        diff = cv.absdiff(right_roi, left_roi)
+        mean = cv.mean(diff, mask=common_sky_mask)[0]
 
-    while cap.isOpened():
-        if not paused:
-            ret, frame = cap.read()
-            if not ret: break
+        if mean < min_mean:
+            min_mean = mean
+            v_shift = v
 
-        f = min((float(width) / (float(frame.shape[1] / 2) - 2 * border)),
-                (float(height) / (float(frame.shape[0]) - 2 * border)))
+    min_mean = float('inf')
 
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    for h in range(h_range[0], h_range[1]):
+        left_roi = left_gray[
+                   border + v_shift:height - border + v_shift,
+                   border + h:w_half - border + h]
+        sky_left_roi = sky_left[
+                       border + v_shift:height - border + v_shift,
+                       border + h:w_half - border + h]
 
-        right = gray[border:frame.shape[0] - border, round(frame.shape[1] / 2) + border:frame.shape[1] - border]
-        left = gray[border + v_shift + manual_v_shift:frame.shape[0] - border + v_shift + manual_v_shift,
-               border + h_shift + manual_h_shift:round(frame.shape[1] / 2) - border + h_shift + manual_h_shift]
+        right_roi = right_gray[
+                    border:height - border,
+                    border:w_half - border]
+        sky_right_roi = sky_right[
+                        border:height - border,
+                        border:w_half - border]
 
-        diff = cv.absdiff(right, left)
-        display_diff = cv.cvtColor(diff, cv.COLOR_GRAY2BGR)
+        if left_roi.shape != right_roi.shape:
+            continue
 
-        if paused:
-            cv.putText(display_diff, "Paused", (32, 32),
-                       cv.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 255), 1)
+        common_sky_mask = cv.bitwise_and(sky_left_roi, sky_right_roi)
+        diff = cv.absdiff(right_roi, left_roi)
+        mean = cv.mean(diff, mask=common_sky_mask)[0]
 
-        controls_text = ["WASD - manual shift",
-                         "SPACE - pause",
-                         "C - auto calibrate",
-                         "Q - quit"]
-        draw_text_lines(display_diff, controls_text, (32, height), bottom_origin=True, color=(0, 255, 255))
+        if mean < min_mean:
+            min_mean = mean
+            h_shift = h
 
-        cv.imshow('resized', display_diff)
-
-        key = cv.waitKey(10)
-        if key == ord('w'):  # UP
-            manual_v_shift = manual_v_shift + 1
-        if key == ord('s'):  # DOWN
-            manual_v_shift = manual_v_shift - 1
-        if key == ord('a'):  # LEFT
-            manual_h_shift = manual_h_shift - 1
-        if key == ord('d'):  # RIGHT
-            manual_h_shift = manual_h_shift + 1
-        if key == ord(' '):  # pause/play
-            paused = not paused
-
-        if key == ord('c'):
-            manual_v_shift = 0
-            manual_h_shift = 0
-            v_shift, h_shift = auto_calibrate_stereo(frame, border)
-
-        if key == ord('q'):
-            break
-
-    cap.release()
-    cv.destroyAllWindows()
+    return v_shift, h_shift

@@ -1,144 +1,215 @@
 import numpy as np
 import cv2 as cv
-from calibration import auto_calibrate_stereo
+from collections import deque
+from threading import Thread, Lock
+import time
+import cProfile
+
+from calibration import calibrate_full, calibrate_continuous, calibrate_sky_full, calibrate_sky_continuous, cropped_mask
 from detection import detect_objects
-from opencv_utils import draw_text_lines
+from sky_detection import detect_sky, min_valley_threshold
+
+from opencv_utils import draw_text_lines, draw_semitransparent_mask2
+
+
+def calibration_worker(frames_to_calibrate, border, max_deviation, use_sky_calibration: bool = False):
+    global v_shift, h_shift, calibration_in_progress, calibration_lock, full_calibration_needed, sky_crop_pixels
+
+    while True:
+        if frames_to_calibrate:
+            calibration_in_progress = True
+            frame = frames_to_calibrate.popleft()
+
+            if full_calibration_needed:
+                full_calibration_needed = False
+                if use_sky_calibration:
+                    new_v, new_h = calibrate_sky_full(frame, border, sky_crop_pixels)
+                else:
+                    new_v, new_h = calibrate_full(frame, border)
+            else:
+                with calibration_lock:
+                    prev_v = v_shift
+                    prev_h = h_shift
+
+                if use_sky_calibration:
+                    new_v, new_h = calibrate_sky_continuous(frame, border, prev_v, prev_h, max_deviation, sky_crop_pixels)
+                else:
+                    new_v, new_h = calibrate_continuous(frame, border, prev_v, prev_h, max_deviation)
+
+            with calibration_lock:
+                v_shift, h_shift = new_v, new_h
+
+            calibration_in_progress = False
+        time.sleep(0.001)  # prevent high CPU usage
+
+
+def display_histogram(frame, origin: tuple, values: np.ndarray, threshold_value: int):
+    hist_height = 100
+    hist_width = 256
+    hist_img = np.zeros((hist_height, hist_width, 3), dtype=np.uint8)
+
+    hist = cv.calcHist([values], [0], None, [256], [0, 256])
+    cv.normalize(hist, hist, 0, hist_height, cv.NORM_MINMAX)
+
+    for i in range(256):
+        if hist[i][0] == 0:
+            cv.line(hist_img, (i, hist_height), (i, 0), (100, 100, 100), 1)
+        else:
+            cv.line(hist_img, (i, hist_height), (i, hist_height - int(hist[i][0])), (255, 255, 255), 1)
+
+    cv.line(hist_img, (threshold_value, 0), (threshold_value, hist_height), (0, 0, 255), 1)
+
+    y, x = origin
+    frame[x:x + hist_height, y:y + hist_width] = hist_img
+
+    return frame
 
 
 if __name__ == "__main__":
-    file_name = "C:/Users/andre/PycharmProjects/turret/videos/stereo_birds_04.mp4"
-
-    cap = cv.VideoCapture(file_name)
+    file_name = "videos/stereo-0724-04.mp4"
 
     cv.namedWindow("resized", cv.WINDOW_NORMAL)
     cv.setWindowProperty("resized", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
     cv.setWindowProperty("resized", cv.WND_PROP_FULLSCREEN, cv.WINDOW_FULLSCREEN)
     (x, y, width, height) = cv.getWindowImageRect("resized")
 
-    roi_top = 640
-    border = 50
-
+    cap = cv.VideoCapture(file_name)
     ret, frame = cap.read()
 
-    f = min((float(width) / (float(frame.shape[1] / 2) - 2 * border)),
-            (float(height) / (float(frame.shape[0]) - 2 * border)))
-    cv.resizeWindow("resized", round(float(frame.shape[1] / 2 - 2 * border) * f),
-                    round(float(frame.shape[0] - 2 * border) * f))
+    border: int = 30
+    sky_crop_pixels: int = 16
+    max_deviation: int = 5
 
-    v_shift, h_shift = auto_calibrate_stereo(frame, border)
+    fy = frame.shape[0]
+    fx = frame.shape[1]
+    f = min((float(width) / (float(fx / 2) - 2 * border)),
+            (float(height) / (float(fy) - 2 * border)))
+    cv.resizeWindow("resized",
+                    int((fx / 2 - 2 * border) * f),
+                    int((fy - 2 * border) * f))
 
-    is_first_resize = True
-    paused = False
+    v_shift, h_shift = calibrate_full(frame, border)
 
-    bg_subtractor = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
-    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))
-    trackers = cv.legacy.MultiTracker_create()
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (10, 10))
 
-    detection_mode = False
-    detection_frames = 0
-    N_DETECTION_FRAMES = 10
+    show_diff: bool = False
 
-    #MIN_TRACKING_CONFIDENCE = 0.4
-    #tracker_confidence = {}
-    #tracker_counter = 0
+    previous_frame_time: float = time.time()
+    frame_count: int = 0
+
+    full_calibration_needed: bool = False
+    full_calibration_interval: int = 10  # полная калибровка каждые 10 кадров, чтобы не сдуреть
+
+    calibration_in_progress: bool = False
+    calibration_lock = Lock()
+    frames_to_calibrate = deque()
+    calibration_thread = Thread(target=calibration_worker, args=(frames_to_calibrate, border, max_deviation, True))
+    calibration_thread.daemon = True
+    calibration_thread.start()
+
+    pr = cProfile.Profile()
+    pr.enable()
+    #fourcc = cv.VideoWriter_fourcc(*'MP4V')
+    #out = cv.VideoWriter('videos/output.mp4', fourcc, 30.0, (1500, 1100))
 
     while cap.isOpened():
-        if not paused:
-            ret, frame = cap.read()
-            if not ret: break
+        ret, frame = cap.read()
+        if not ret:
+            print("Can't receive frame (stream end?). Exiting ...")
+            break
 
-        f = min((float(width) / (float(frame.shape[1] / 2) - 2 * border)),
-                (float(height) / (float(frame.shape[0]) - 2 * border)))
+        frame_count += 1
+        if frame_count % full_calibration_interval == 0:
+            full_calibration_needed = True
 
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+        if (not calibration_in_progress) and (not frames_to_calibrate):
+            frames_to_calibrate.append(frame.copy())
 
-        right = gray[border:frame.shape[0] - border, round(frame.shape[1] / 2) + border:frame.shape[1] - border]
-        left = gray[border + v_shift:frame.shape[0] - border + v_shift,
-               border + h_shift:round(frame.shape[1] / 2) - border + h_shift]
+        with calibration_lock:
+            current_v_shift, current_h_shift = v_shift, h_shift
 
-        diff = cv.absdiff(right, left)
+        right = frame[
+                border:fy - border,
+                fx // 2 + border:fx - border]
+        left = frame[
+               border + current_v_shift:fy - border + current_v_shift,
+               border + current_h_shift:fx // 2 - border + current_h_shift]
 
-        # detection/tracking
-        boxes = []
+        # уменьшаем разрешение до 800х600
+        right_small = cv.resize(right, (0, 0), fx=0.5, fy=0.5, interpolation=cv.INTER_AREA)
+        left_small = cv.resize(left, (0, 0), fx=0.5, fy=0.5, interpolation=cv.INTER_AREA)
 
-        if paused:
-            pass # не пихать в историю одинаковые бессмысленные кадры на паузе
-        elif detection_mode:
-            bg_mask = bg_subtractor.apply(left)
-            bg_mask = cv.morphologyEx(bg_mask, cv.MORPH_OPEN, kernel)
+        sky_right, fs_right = detect_sky(right_small)
+        sky_left, fs_left = detect_sky(left_small)
+        sky = cv.bitwise_and(sky_right, sky_left)
 
-            boxes = detect_objects(bg_mask, min_area=60)
+        sky_cropped = cropped_mask(sky, sky_crop_pixels // 2)  # обрезать веточки всякие по краям
 
-            detection_frames -= 1
-            if detection_frames == 0:
-                detection_mode = False
+        # увеличиваем маску неба обратно
+        sky_cropped = cv.resize(sky_cropped, (left.shape[1], left.shape[0]), interpolation=cv.INTER_NEAREST)
 
-            if len(boxes) > 0:
-                trackers = cv.legacy.MultiTracker_create()
-                for box in boxes:
-                    box_float = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-                    trackers.add(cv.legacy.TrackerCSRT_create(), left, box_float)
+        right_gray = cv.cvtColor(right, cv.COLOR_BGR2GRAY)
+        left_gray = cv.cvtColor(left, cv.COLOR_BGR2GRAY)
+        diff = cv.absdiff(right_gray, left_gray)
 
-        elif len(trackers.getObjects()) > 0:
-            success, boxes = trackers.update(left)
-            if success:
-                int_boxes = []
-                for box in boxes:
-                    # это нужно чтобы рисовать на экране (он только целые ест)
-                    x, y, w, h = [int(v) for v in box]
-                    int_boxes.append((x, y, w, h))
+        diff = cv.bitwise_and(diff, diff, mask=sky_cropped)
 
-                boxes = int_boxes
+        diff_threshold = min_valley_threshold(diff)
 
-            else:
-                boxes = []
+        # absdiff маска
+        _, diff_mask = cv.threshold(diff, diff_threshold, 255, cv.THRESH_BINARY)
+        #diff_mask = cv.morphologyEx(diff_mask, cv.MORPH_OPEN, kernel)  # удаление шума
+        diff_mask = cv.morphologyEx(diff_mask, cv.MORPH_CLOSE, kernel)  # заполнение пробелов
 
-        # рисуем bounding boxes и пишем информацию об объекте из карты глубины
-        display_diff = cv.cvtColor(diff, cv.COLOR_GRAY2BGR)
+        boxes = detect_objects(diff_mask, min_area=5, max_area=100)
 
-        for box in boxes:
-            x, y, w, h = box[0], box[1], box[2], box[3]
-            cv.rectangle(display_diff, (x, y), (x + w, y + h), (0, 255, 0), 4)
+        if show_diff:
+            display = cv.cvtColor(diff, cv.COLOR_GRAY2BGR)
+        else:
+            display = left
 
-            object_diff = diff[y:y + h, x:x + w]
-            median_diff = np.median(object_diff[object_diff > 0])
+        #display = draw_semitransparent_mask2(display, sky_cropped, color=(255, 0, 0), alpha=0.3)
 
-            cv.putText(display_diff, f"{median_diff:.1f}", (x, y - 20),
+        display = display_histogram(display, (1500 - 256, 50), diff, diff_threshold)
+
+        for (x, y, w, h, area) in boxes:
+            cv.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            text_y = y - 40
+            if text_y < 10:  # если объект вверху кадра
+                text_y = y + h + 20  # показываем текст под объектом
+
+            cv.putText(display, f"{area} px", (x, text_y),
                        cv.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 255), 1)
 
-        status_text = ""
-        if paused:
-            status_text = "Paused"
-        elif detection_mode:
-            status_text = "Detecting"
-        else:
-            status_text = f"Tracking {len(boxes)} objects"
-        cv.putText(display_diff, status_text, (32, 32),
-                   cv.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 255), 1)
+        sky_area: float = (cv.countNonZero(sky) * 4.0) / (left.shape[0] * left.shape[1])
+        status_text = [
+            f"Sky area: {round(sky_area * 100, 2)}%",
+            f"Detecting {len(boxes)} objects",
+            f"h_shift: {current_h_shift} px",
+            f"v_shift: {current_v_shift} px",
+        ]
 
-        controls_text = ["D - detect moving objects",
-                         "SPACE - pause",
-                         "C - recalibrate",
-                         "Q - quit"]
-        draw_text_lines(display_diff, controls_text, (32, height), bottom_origin=True, color=(0, 255, 255))
+        draw_text_lines(display, status_text, (32, 32), bottom_origin=False, color=(0, 255, 255))
 
-        cv.imshow("resized", display_diff)
+        fps: float = 1 / (time.time() - previous_frame_time)
+        previous_frame_time = time.time()
+        cv.putText(display, f"{round(fps, 2)} FPS", (display.shape[1] - 128, 32),
+                   cv.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 255), 1)
 
-        # управление с клавиатуры
-        key = cv.waitKey(10)
-        if key == ord("d") and not paused:  # detect
-            detection_mode = True
-            detection_frames = N_DETECTION_FRAMES
+        cv.imshow("resized", display)
+        #out.write(display)
 
-            # сбрасываем трекеры
-            trackers = cv.legacy.MultiTracker_create()
-
-        if key == ord(" "):  # pause/play
-            paused = not paused
-        if key == ord("c"):  # recalibrate
-            v_shift, h_shift = auto_calibrate_stereo(frame, border)
+        key = cv.waitKey(1)
+        if key == ord("s"):  # show/hide absdiff
+            show_diff = not show_diff
         if key == ord("q"):  # quit
             break
 
+    #out.release()
     cap.release()
     cv.destroyAllWindows()
+
+    pr.disable()
+    pr.print_stats(sort='cumtime')
+
