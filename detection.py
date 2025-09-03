@@ -3,6 +3,8 @@ import cv2 as cv
 from calibration import calibrate_full
 from opencv_utils import draw_text_lines
 
+import time
+
 
 def detect_objects(mask, min_area=100, max_area=1000):
     contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
@@ -52,6 +54,7 @@ if __name__ == "__main__":
     # 0 - absdiff mask & background mask
     # 1 - absdiff mask only
     # 2 - background mask only
+    previous_frame_time: float = time.time()
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -122,9 +125,14 @@ if __name__ == "__main__":
 
         draw_text_lines(display, controls_text, (32, height + 32), bottom_origin=True, color=(0, 255, 255))
 
+        fps: float = 1 / (time.time() - previous_frame_time)
+        previous_frame_time = time.time()
+        cv.putText(display, f"{round(fps, 2)} FPS", (display.shape[1] - 128, 32),
+                   cv.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 255), 1)
+
         cv.imshow("resized", display)
 
-        key = cv.waitKey(10)
+        key = cv.waitKey(1)
 
         if key == ord("1"):
             detection_method = 0
