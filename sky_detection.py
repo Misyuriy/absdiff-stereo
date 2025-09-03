@@ -55,9 +55,7 @@ def ground_exists(lightness: np.ndarray, max_zero_ratio: float = 0.2) -> bool:
 def detect_sky(
         frame: np.ndarray,
         min_sky_area: float = 0.2,
-        texture_dispersion_window: int = 10,
-        variance_threshold: int = 60,
-        use_texture: bool = False
+        texture_dispersion_window: int = 10
 ):
     h, w = frame.shape[:2]
 
@@ -91,13 +89,13 @@ def detect_sky(
 
     # ищем регион неба
     contours, _ = cv.findContours(combined, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    if not contours:  # возвращаем черную маску - неба в кадре нет
+    if not contours:  # неба в кадре нет
         return sky_mask, False
 
     min_contour_area = w * h * min_sky_area
     large_contours = [c for c in contours if cv.contourArea(c) > min_contour_area]
 
-    if not large_contours:  # возвращаем черную маску - неба в кадре нет
+    if not large_contours:  # неба в кадре нет
         return sky_mask, False
 
     largest_contour = max(large_contours, key=cv.contourArea)
